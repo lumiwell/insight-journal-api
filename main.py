@@ -1,21 +1,34 @@
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Literal, cast
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import httpx
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessageParam
 from dotenv import load_dotenv
+import json
+
+from fastapi.middleware.cors import CORSMiddleware
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ==========================================
 # 1. 声明支持多轮对话的数据模型
 # ==========================================
 class Message(BaseModel):
-    role: str      # 角色："user" 或 "assistant"
+    role: Literal["user", "assistant", "system"]      # 角色："user", "assistant" 或 "system"
     content: str   # 消息内容
 
 class ChatRequest(BaseModel):
@@ -29,7 +42,9 @@ if not API_KEY:
     raise RuntimeError("🚨 环境变量 DASHSCOPE_API_KEY 未设置！请检查 .env 文件。")
 
 BASE_URL = "https://ws-c56yietppdmtmf3m.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
-MODEL_NAME = "qwen-plus"
+MODEL_NAME = "qwen3.7-max"
+
+aclient = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 # ==========================================
 # 防御性 Prompt 动态加载机制
@@ -62,44 +77,30 @@ SYSTEM_PROMPT = load_system_prompt()
 @app.post("/api/v1/chat")
 async def handle_diary_chat(request: ChatRequest):
     # 动态组装 Payload：System Prompt 永远在第一位，紧接着拼接前端传来的历史对话记录
-    formatted_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    formatted_messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": SYSTEM_PROMPT}]
     
     # 遍历前端传来的消息，组装进上下文中
     for msg in request.messages:
-        formatted_messages.append({"role": msg.role, "content": msg.content})
+        formatted_messages.append(cast(ChatCompletionMessageParam, {"role": msg.role, "content": msg.content}))
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": formatted_messages,
-        "temperature": 0.7
-    }
-
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async def generate():
         try:
-            response = await client.post(
-                f"{BASE_URL}/chat/completions",
-                json=payload,
-                headers=headers
+            stream = await aclient.chat.completions.create(
+                model=MODEL_NAME,
+                messages=formatted_messages,
+                temperature=0.7,
+                stream=True
             )
-            
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code, 
-                    detail=f"大模型 API 调用失败: {response.text}"
-                )
-                
-            result = response.json()
-            ai_response = result["choices"][0]["message"]["content"]
-            
-            return {
-                "status": "success",
-                "reply": ai_response
-            }
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    # 按照用户要求，返回 data: {content}\n\n 格式
+                    # 为了避免 content 中的换行符破坏 SSE 格式，这里使用 json.dumps 序列化
+                    yield f"data: {json.dumps(content, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            # 捕获异常时也尽量保持 SSE 格式，通知客户端错误信息
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=500, detail=f"网络请求异常: {exc}")
+    # 必须使用 StreamingResponse，并指定 media_type="text/event-stream"
+    return StreamingResponse(generate(), media_type="text/event-stream")
