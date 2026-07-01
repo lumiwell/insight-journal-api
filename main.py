@@ -2,7 +2,8 @@ import os
 from pathlib import Path
 from typing import List, Literal, cast
 import uuid
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from openai import AsyncOpenAI
@@ -13,7 +14,11 @@ import json
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel.ext.asyncio.session import AsyncSession
 from database import get_session
-from crud import get_or_create_session, save_message, get_recent_messages
+from crud import get_or_create_session, save_message, get_recent_messages, get_user_by_email, create_user, bind_session_to_user
+from auth import verify_password, create_access_token, SECRET_KEY, ALGORITHM
+from schemas import UserCreate, UserLogin, Token, UserResponse
+from models import User
+import jwt
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
@@ -70,15 +75,87 @@ def load_system_prompt() -> str:
 
 SYSTEM_PROMPT = load_system_prompt()
 
+security = HTTPBearer(auto_error=False)
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: AsyncSession = Depends(get_session)) -> User | None:
+    if not credentials:
+        return None
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str | None = payload.get("sub")
+        if email is None:
+            return None
+    except jwt.PyJWTError:
+        return None
+    user = await get_user_by_email(db, email=email)
+    return user
+
+@app.post("/api/v1/auth/register", response_model=Token)
+async def register(user_in: UserCreate, db: AsyncSession = Depends(get_session)):
+    user = await get_user_by_email(db, email=user_in.email)
+    if user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = await create_user(db, email=user_in.email, password=user_in.password)
+    
+    if user_in.guest_session_id:
+        await bind_session_to_user(db, user_in.guest_session_id, user.id)
+        
+    access_token = create_access_token(data={"sub": user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/api/v1/auth/login", response_model=Token)
+async def login(user_in: UserLogin, db: AsyncSession = Depends(get_session)):
+    user = await get_user_by_email(db, email=user_in.email)
+    if not user or not verify_password(user_in.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        
+    if user_in.guest_session_id:
+        await bind_session_to_user(db, user_in.guest_session_id, user.id)
+        
+    access_token = create_access_token(data={"sub": user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/api/v1/users/me", response_model=UserResponse)
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    return current_user
+
+@app.get("/api/v1/chat/{session_id}/messages")
+async def get_session_messages(session_id: str, db: AsyncSession = Depends(get_session), current_user: User = Depends(get_current_user)):
+    try:
+        session_id_uuid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid session_id format.")
+    
+    session = await get_or_create_session(db, session_id_uuid)
+    
+    if session.user_id is not None:
+        if current_user is None or session.user_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this session")
+            
+    recent_messages = await get_recent_messages(db, session_id_uuid, limit=100)
+    return recent_messages
+
 @app.post("/api/v1/chat")
-async def handle_diary_chat(request: ChatRequest, db: AsyncSession = Depends(get_session)):
+async def handle_diary_chat(request: ChatRequest, db: AsyncSession = Depends(get_session), current_user: User = Depends(get_current_user)):
     try:
         session_id_uuid = uuid.UUID(request.session_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session_id format. Must be a valid UUID.")
 
     # 1. 获取或创建会话
-    await get_or_create_session(db, session_id_uuid)
+    session = await get_or_create_session(db, session_id_uuid)
+    
+    # Check session ownership
+    if session.user_id is not None:
+        if current_user is None or session.user_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this session")
 
     # 2. 落库最新的用户消息
     await save_message(db, session_id_uuid, request.message.role, request.message.content)
